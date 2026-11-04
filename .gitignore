@@ -1,0 +1,15 @@
+# Dependencias
+node_modules/
+
+#Variables de entorno: contienen credenciales
+.env
+.env.local
+
+#Logs y datos locales
+*.log
+*.sqlite
+data/
+
+#Sistema operativo
+Thumbs.db
+.DS_Store
