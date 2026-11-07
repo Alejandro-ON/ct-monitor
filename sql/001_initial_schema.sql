@@ -45,3 +45,36 @@ CREATE TABLE certificates (
 
     CONSTRAINT certificates_log_entry_unique UNIQUE (log_url, log_index)
 );
+
+CREATE TABLE candidates (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+
+    domain      TEXT    NOT NULL UNIQUE,
+    brand       TEXT    NOT NULL,
+
+    match_type  TEXT    NOT NULL,
+    score       INTEGER NOT NULL,
+
+    first_issued_at     TIMESTAMPTZ NOT NULL,
+    first_seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    manual_label        TEXT,
+    labelled_at         TIMESTAMPTZ,
+    label_note          TEXT,
+
+    first_flagged_at    TIMESTAMPTZ,
+    flagged_by          TEXT,
+
+    CONSTRAINT candidates_match_type_valid
+        CHECK (match_type IN ('label', 'typo', 'contains')),
+
+    CONSTRAINT candidates_manual_label_valid
+        CHECK (manual_label IS NULL
+               OR manual_label IN ('fraudulent', 'legitimate', 'unclear')),
+
+    CONSTRAINT candidates_label_consistent
+        CHECK ((manual_label IS NULL) = (labelled_at IS NULL)),
+
+    CONSTRAINT candidates_flag_consistent
+        CHECK ((first_flagged_at IS NULL) = (flagged_by IS NULL))
+);
