@@ -78,3 +78,30 @@ CREATE TABLE candidates (
     CONSTRAINT candidates_flag_consistent
         CHECK ((first_flagged_at IS NULL) = (flagged_by IS NULL))
 );
+
+
+/*
+Table ManyToMany
+
+A certificate can have many domains AND a domain can have many certificates.
+
+certificate_id:
+    Looks for the primary key (id) of certificate's table
+
+candidate_id;
+    Looks for the primary key (id) of candidates's table
+
+DELETE CASCADE:
+    A certificate reveals a candidate, if the certificate disappears
+    there is no need to keep the useless candidates. That's why
+
+PRIMARY KEY:
+    Here the primary key is the certificate+candidate couple. This is
+    used in order to avoid duplicates.
+*/
+CREATE TABLE certificate_candidates(
+    certificate_id      BIGINT NOT NULL REFERENCES certificates(id) ON DELETE CASCADE,
+    candidate_id        BIGINT NOT NULL REFERENCES candidates(id)   ON DELETE CASCADE,
+
+    PRIMARY KEY (certificate_id, candidate_id)
+);
