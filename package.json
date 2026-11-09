@@ -1,0 +1,22 @@
+{
+  "name": "ct-monitor",
+  "version": "0.1.0",
+  "description": "Real-time Certificate Transparency monitoring for the early detection of domains impersonating Spanish institutions and brands, with longitudinal measurement of how long those domains remain unflagged by public blocklists.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --env-file=.env src/index.js",
+    "db:test": "node --env-file=.env src/db-test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Alejandro-ON/ct-monitor.git"
+  },
+  "keywords": [],
+  "author": "Alejandro Olías Núñez",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Alejandro-ON/ct-monitor/issues"
+  },
+  "homepage": "https://github.com/Alejandro-ON/ct-monitor#readme"
+}
