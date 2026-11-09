@@ -6,7 +6,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node --env-file=.env src/index.js",
-    "db:test": "node --env-file=.env src/db-test.js"
+    "db:test": "node --env-file=.env src/db-test.js",
+    "logs:test": "node src/collector/logs-test.js"
   },
   "repository": {
     "type": "git",
