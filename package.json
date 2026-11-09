@@ -18,5 +18,8 @@
   "bugs": {
     "url": "https://github.com/Alejandro-ON/ct-monitor/issues"
   },
-  "homepage": "https://github.com/Alejandro-ON/ct-monitor#readme"
+  "homepage": "https://github.com/Alejandro-ON/ct-monitor#readme",
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
 }
