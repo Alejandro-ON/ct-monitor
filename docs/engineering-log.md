@@ -199,7 +199,7 @@ The prototype is archived without continuation. Its code and data are retained a
 
 ### AD-03: Four-entity data model
 
-**Context.** The prototype stored everything in a single `candidates` table, with heavy duplication: the same certificate appeared once per CT log that published it.
+**Context.** The prototype stored everything in a single `candidates` table, with heavy duplication: the same certificate appeared once per CT log that published it, producing 2,155 rows for 865 real domains.
 
 **Decision.** Split into four tables according to each entity's lifecycle:
 
@@ -230,6 +230,20 @@ The `flagged` column on `checks` is nullable, and the third state is intentional
 
 ---
 
+### AD-05: Constraints enforced in the database, not only in code
+
+**Context.** Value validation could live entirely in the application layer.
+
+**Decision.** The schema carries `CHECK` constraints for closed value domains (`match_type`, `manual_label`) and for cross-column coherence (a label requires its timestamp; a flag requires its source).
+
+**Rationale.** The application is not the only writer. Maintenance scripts, manual `UPDATE` statements during analysis, and future tooling all bypass it. A typo inserting `fraudlent` instead of `fraudulent` would silently corrupt the labelled ground truth, and would only surface months later when counting by category.
+
+The database is the last line of defence and the only one that is always present.
+
+**Not applied to `source` on `checks`.** The set of blocklist sources is open and expected to grow during the study, so an added constraint would mean a migration per new source. Validation for that column stays in the application layer. The distinction is whether the value domain is closed by design.
+
+---
+
 ## 6. Development environment
 
 ### 6.1 Components
@@ -237,7 +251,7 @@ The `flagged` column on `checks` is nullable, and the third state is intentional
 | Component | Version | Role |
 |---|---|---|
 | Node.js | LTS | runtime for collector and API |
-| PostgreSQL | 17 | storage |
+| PostgreSQL | 18.6 | storage |
 | Git | — | version control |
 | Visual Studio Code | — | editor |
 
@@ -245,6 +259,7 @@ The `flagged` column on `checks` is nullable, and the third state is intentional
 
 ```
 ct-monitor/
+├── .gitattributes
 ├── .gitignore
 ├── .env.example
 ├── README.md
@@ -281,7 +296,7 @@ The repository follows **Conventional Commits**:
 
 Descriptions use the present imperative (`add`, not `added`), completing the sentence *"if applied, this commit will…"*.
 
-**Commits are small and frequent.** A granular history documents the construction process; a single final commit documents nothing.
+**Commits are small and frequent.** A granular history documents the construction process; a single final commit documents nothing. Granularity is measured in coherent changes, not in lines: every commit must leave the project in a valid state.
 
 ### 6.4 Credential handling
 
@@ -292,6 +307,12 @@ Credentials live in a `.env` file excluded from version control. The repository 
 ### 6.5 Language policy
 
 All repository content is in English: identifiers, comments, commit messages, documentation and schema. Proper nouns are not translated: `AEAT`, `SEPE`, `Correos` and other entity names appear as they are.
+
+### 6.6 Line endings
+
+A `.gitattributes` file normalises all text files to `LF` inside the repository, with an exception for Windows scripts, which require `CRLF` to run.
+
+**Rationale.** Development happens on Windows but the collector is expected to run on Linux. Without normalisation, mixed endings make diffs unreadable (an entire file appears modified when one line changed) and shell scripts fail on Linux with misleading interpreter errors. Fixing this in the repository rather than in each developer's Git configuration makes the behaviour deterministic.
 
 ---
 
@@ -365,19 +386,15 @@ Module system, `package.json`, npm, semantic versioning.
 
 ---
 
-### Session 5 · PostgreSQL: installation and first connection
+### Session 5 · PostgreSQL: installation, schema, first migration
 
-**Status:** in progress.
+**Status:** complete.
 
-#### 5.1 Initial observation
+#### 5.1 Installation note
 
 On Windows, PostgreSQL installs as a **system service**. It starts with the machine and listens in the background. There is no application to "open": what one opens is a **client** that connects to it.
 
-Service status check:
-
-```powershell
-Get-Service -Name postgresql*
-```
+The installer did not add the `bin` directory to `PATH`, so `psql` was unavailable from the terminal until added manually. Recorded because it blocks the first connection attempt and the error message does not point at the cause.
 
 #### 5.2 Anatomy of the connection
 
@@ -420,41 +437,49 @@ Step 6 has direct architectural consequences. PostgreSQL uses a **process-per-co
 
 **Hence the need for connection pooling** in the application layer: a small set of persistent connections shared across queries, rather than opening one per operation. This is the same reasoning behind HTTP persistent connections.
 
-#### 5.5 psql commands
+#### 5.5 Role and database
 
-Backslash-prefixed commands belong to the client, not to SQL:
-
-| Command | Function |
-|---|---|
-| `\l` | list databases |
-| `\c <db>` | connect to a database |
-| `\dt` | list tables |
-| `\d <table>` | describe columns, types, indexes and constraints |
-| `\di` | list indexes |
-| `\x` | toggle expanded output |
-| `\timing` | report duration of each query |
-| `\i <file>` | execute a SQL file |
-| `\q` | quit |
-
-Non-interactive invocations, as used in the project:
-
-```powershell
-# Run a query and exit
-psql -U postgres -c "SELECT version();"
-
-# Apply a migration
-psql -U alejandro -d ct_monitor -f sql/001_initial_schema.sql
-
-# Connect with a connection string (the same one the application will use)
-psql "postgresql://alejandro:password@localhost:5432/ct_monitor"
+```sql
+CREATE ROLE ctmonitor WITH LOGIN PASSWORD '...';
+CREATE DATABASE ct_monitor OWNER ctmonitor;
 ```
 
-#### 5.6 Outstanding
+**An application role rather than the superuser**, for three reasons: least privilege (the application never needs to drop databases or create roles, so an exploited vulnerability is contained); the credential ends up in a configuration file, and that file should not hold superuser credentials; and the role identifies the service rather than a person, so it remains meaningful if the system is deployed to a server.
 
-- [ ] Create the application role and the database
-- [ ] Write and apply the initial migration
-- [ ] Verify the schema
-- [ ] Connect from Node via the `pg` package
+In PostgreSQL a role and a user are the same entity. A role with the `LOGIN` attribute can connect; without it, it acts as a permission group.
+
+#### 5.6 Migration applied
+
+`sql/001_initial_schema.sql` creates four tables, six indexes and five catalog comments. Applied and verified against the live database.
+
+Two index categories are worth recording:
+
+**Partial indexes** cover only rows satisfying a `WHERE` clause, staying far smaller than a full index. Both of the study's working queries filter exactly this way:
+
+```sql
+CREATE INDEX idx_candidates_unlabelled
+    ON candidates (score DESC)
+    WHERE manual_label IS NULL;
+```
+
+**Composite indexes** only serve queries filtering on a prefix of their columns. `idx_checks_candidate (candidate_id, checked_at DESC)` serves filtering by candidate, or by candidate ordered by date, but not by date alone.
+
+A known gap is recorded rather than pre-emptively fixed: the composite primary key on `certificate_candidates` does not support lookups by `candidate_id` alone. An index will be added if that access pattern proves frequent. Adding indexes speculatively costs write throughput and storage for no measured benefit.
+
+#### 5.7 Catalog comments
+
+The schema carries `COMMENT ON` statements. These are stored inside the database and displayed by `\d+`. Documentation held in the catalog cannot drift away from the schema the way an external file can.
+
+#### 5.8 Workflow established
+
+The sequence for every future migration:
+
+1. Write the file.
+2. Apply it with `psql -f`.
+3. Verify with `\d+`.
+4. Commit only after it has applied cleanly.
+
+A migration file that has never been executed may contain syntax errors, and committing one puts the repository in a state that looks valid and is not. During development, the database is dropped and the migration reapplied as often as needed; once applied outside development, a migration is never edited, and changes go into a new numbered file.
 
 ---
 
@@ -516,6 +541,16 @@ Three network traversals. Negligible over loopback, significant against a remote
 
 Node's event loop is precisely that: a loop that asks the system which descriptors have data ready and services only those. Hence a single thread sustaining thousands of connections.
 
+### 8.2 Relational modelling decisions
+
+**Natural and surrogate keys.** `candidates` carries both: `id`, an artificial integer with no meaning, and `domain`, the identifier that has meaning in the real world. The surrogate key is the primary key because foreign keys referencing it are cheaper as an 8-byte integer than as a variable-length string, and because it remains stable if domain normalisation ever changes. A `UNIQUE` constraint on `domain` preserves the natural key's guarantee.
+
+**Many-to-many relations** cannot be expressed directly in the relational model. A certificate reveals several domains and a domain appears in several certificates, so the relation requires a bridge table where each row is one concrete pair. The composite primary key on that table both identifies rows and prevents duplicates, which is why it carries no surrogate key of its own.
+
+**Entities and events.** Three of the four tables store entities: a certificate, a domain, a relation. `checks` stores events, and the distinction drives its design. Entity tables carry uniqueness constraints to prevent duplication; `checks` deliberately has none, because the same pair of candidate and source must repeat once per day. That repetition is the measurement.
+
+**Arrays versus a related table.** `dns_names` is a native array rather than a separate table because the list is always read as a unit and never queried by individual element. Applying the same reasoning to `certificate_candidates` would have been wrong, since that relation does get queried from both directions. The access pattern, not normal form alone, decides.
+
 ---
 
 ## 9. Glossary
@@ -523,6 +558,8 @@ Node's event loop is precisely that: a loop that asks the system which descripto
 **Architecture Decision Record (ADR).** A short document capturing a single architectural decision, its context, the alternatives considered and the consequences accepted.
 
 **Certificate Transparency.** The framework specified in RFC 6962 requiring Certificate Authorities to publish every issued certificate to public, auditable, append-only logs.
+
+**Composite index.** An index over several columns. Column order matters: it serves queries filtering on a prefix of those columns, not on an arbitrary subset.
 
 **Connection four-tuple.** The combination of source IP and port with destination IP and port, uniquely identifying a TCP connection.
 
@@ -540,15 +577,21 @@ Node's event loop is precisely that: a loop that asks the system which descripto
 
 **MVCC.** Multiversion concurrency control. Each transaction observes a consistent snapshot, so reads do not block writes and vice versa.
 
+**Natural key.** An attribute that identifies a row by its meaning in the modelled domain, as opposed to a surrogate key generated by the system.
+
 **Partial index.** An index covering only the rows satisfying a condition. Smaller and faster where queries consistently filter on the same criterion.
 
 **Precertificate.** A CT log entry variant issued ahead of the final certificate. Its `leaf_input` field contains only the `TBSCertificate` and is not decodable as a certificate; the full certificate resides in `extra_data`. These account for roughly half of all entries, and omitting them is a common defect in hand-rolled implementations.
 
 **Promise.** An object representing a result not yet available. Three states: pending, fulfilled, rejected.
 
+**Referential integrity.** The guarantee that a foreign key always points at an existing row, enforced by the database rather than by application code.
+
 **SCRAM.** A challenge-response authentication mechanism that avoids transmitting the password.
 
 **Socket.** An endpoint of a bidirectional communication channel, managed by the operating system.
+
+**Surrogate key.** A system-generated identifier with no meaning outside the database, used as primary key for stability and for compact foreign keys.
 
 **Survivorship bias.** An inferential error arising from analysing only the cases that passed a filter, ignoring those that did not.
 
