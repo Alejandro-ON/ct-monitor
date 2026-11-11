@@ -9,7 +9,8 @@
     "db:test": "node --env-file=.env src/db-test.js",
     "logs:test": "node src/collector/logs-test.js",
     "collector:test": "node src/collector/runner-test.js",
-    "parser:test": "node src/collector/parser-test.js"
+    "parser:test": "node src/collector/parser-test.js",
+    "scoring:test": "node src/scoring/classifier-test.js"
   },
   "repository": {
     "type": "git",
