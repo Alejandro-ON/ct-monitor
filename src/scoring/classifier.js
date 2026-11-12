@@ -1,7 +1,8 @@
 // Candidate classifier.
 //
 // Rebuilt from the Python prototype, which scored ~1% precision over
-// 865 domains. Three defects are corrected here; see docs/engineering-log.md.
+// 865 domains. See docs/engineering-log.md for the defects corrected
+// here and the production data that revealed each one.
 
 import { domainToUnicode } from "node:url";
 
@@ -28,7 +29,20 @@ const LEGIT_SUFFIXES = new Set([
     "ibercaja.es", "iberdrola.es", "iberdrola.com", "endesa.com",
     "naturgy.es", "naturgy.com", "movistar.es", "telefonica.com",
     "vodafone.es", "renfe.com", "renfe.es", "mapfre.es", "mapfre.com",
-    "bizum.es", "bizum.com"
+    "bizum.es", "bizum.com",
+
+    // Multinationals: the brand operates under many country domains and
+    // all of them are the real entity. Listing only the .es variant
+    // flags an entire corporate estate as impersonation. Observed in
+    // the first production run: 15 of the top 20 candidates were
+    // legitimate Vodafone country domains.
+    "vodafone.com", "vodafone.co.uk", "vodafone.ie", "vodafone.it",
+    "vodafone.de", "vodafone.cz", "vodafone.nl", "vodafone.pt",
+    "vodafone.gr", "vodafone.ro", "vodafone.hu", "vodafone.co.za",
+    "santander.co.uk", "santander.com.br", "santander.com.mx",
+    "santander.pl", "santander.pt", "santander.cl",
+    "bbva.mx", "bbva.pe", "bbva.com.ar", "bbva.com.co",
+    "mapfre.com.br", "mapfre.com.mx"
 ]);
 
 // Vocabulary typical of a Spanish phishing page.
@@ -67,21 +81,22 @@ const HOMOGLYPHS = new Map(Object.entries({
 // Applied globally they turn hexadecimal infrastructure identifiers into
 // phantom brands: 791033843470 -> ...843470... -> ...8aeato... -> "aeat".
 // That single defect produced 1,140 false positives in the prototype.
-// They are only applied when comparing one label against one brand.
+// They are only applied when comparing one label against one brand, and
+// only to labels that are not mostly digits (see FIX 1b).
 const LEET = new Map(Object.entries({
     "0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t"
 }));
 
-const MIN_BRAND_LEN = 4;      
 // Lowering this to 4 lets short brands (bbva, aeat, sepe) be typo-matched.
 // The risk is concrete: "seat.es" sits at distance 1 from "aeat", and SEAT
 // is a real Spanish brand. Accepted for now because AD-06 means a discarded
 // certificate cannot be recovered, so recall is favoured at collection time
 // and precision is tuned later against the labelled set.
+const MIN_BRAND_LEN = 4;
+
 // MIN_CONTAINS_LEN stays at 6: substring matching on short brands was the
 // prototype's main noise source and that defect is not reintroduced.
-
-const MIN_CONTAINS_LEN = 6;   // FIX 2: shorter brands are not substring-matched
+const MIN_CONTAINS_LEN = 6;
 
 /**
  * Reduces text to a comparable skeleton: lowercase, accents stripped,
@@ -104,6 +119,9 @@ function skeleton(text, { leet = false } = {}) {
  * Plain Levenshtein scores a transposition as 2, since it sees two
  * substitutions. Adjacent swaps are among the most common typosquatting
  * patterns ("bbav" for "bbva"), so they must count as one edit.
+ *
+ * Returns maxDist + 1 when the real distance exceeds the limit, so
+ * callers only learn what they asked about.
  */
 function damerauLevenshtein(a, b, maxDist = 1) {
     if (Math.abs(a.length - b.length) > maxDist) return maxDist + 1;
@@ -151,6 +169,20 @@ function looksRandom(label) {
     return (vowels / label.length) < 0.25 || (digits / label.length) > 0.30;
 }
 
+/**
+ * FIX 1b: true when digits are at least half the label.
+ *
+ * looksRandom only inspects labels of 12 characters or more, so a short
+ * hexadecimal fragment slips through. "4e47" maps cleanly onto "aeat"
+ * under leet substitution, which produced a false positive on AWS
+ * infrastructure in the first production run. Real brands are not
+ * mostly digits.
+ */
+function isDigitHeavy(label) {
+    const digits = [...label].filter(c => c >= "0" && c <= "9").length;
+    return digits * 2 >= label.length;
+}
+
 function isLegit(domain) {
     const d = domain.toLowerCase().replace(/^\*\./, "").replace(/\.$/, "");
     for (const suffix of LEGIT_SUFFIXES) {
@@ -177,9 +209,20 @@ export function classify(domain) {
     if (!flat) return null;
 
     const rawLabels = unicodeForm.split(/[.\-_]/).filter(Boolean);
-    const labels = rawLabels.map(p => skeleton(p)).filter(l => l && !looksRandom(l));
-    const labelsLeet = rawLabels.map(p => skeleton(p, { leet: true }))
-                                .filter(l => l && !looksRandom(l));
+
+    const labels = rawLabels
+        .map(p => skeleton(p))
+        .filter(l => l && !looksRandom(l));
+
+    // Leet substitution only where letters outnumber digits. A short
+    // hexadecimal label like "4e47" maps cleanly onto "aeat", and
+    // looksRandom does not catch it because it only inspects labels of
+    // 12 characters or more.
+    const labelsLeet = rawLabels
+        .map(p => skeleton(p))
+        .filter(l => l && !looksRandom(l) && !isDigitHeavy(l))
+        .map(p => skeleton(p, { leet: true }));
+
     if (labels.length === 0) return null;
 
     let best = null;
@@ -193,7 +236,8 @@ export function classify(domain) {
             matchType = "contains";
         } else if (brand.length >= MIN_BRAND_LEN) {
             for (const label of labels) {
-                if (label.length >= MIN_BRAND_LEN && damerauLevenshtein(label, brand) === 1) {
+                if (label.length >= MIN_BRAND_LEN &&
+                    damerauLevenshtein(label, brand) === 1) {
                     matchType = "typo";
                     break;
                 }
@@ -204,7 +248,8 @@ export function classify(domain) {
 
         // A generic infrastructure label matching a brand is noise.
         if (matchType === "typo" &&
-            labels.some(l => GENERIC_LABELS.has(l) && damerauLevenshtein(l, brand) <= 1)) {
+            labels.some(l => GENERIC_LABELS.has(l) &&
+                             damerauLevenshtein(l, brand) <= 1)) {
             continue;
         }
 
@@ -212,7 +257,8 @@ export function classify(domain) {
 
         if (hadPunycode) score += 3;
         if (skeleton(raw) !== flat) score += 2;   // real homoglyph substitution
-        score += 2 * SUSPICIOUS_TOKENS.filter(t => t.length >= 4 && flat.includes(t)).length;
+        score += 2 * SUSPICIOUS_TOKENS
+            .filter(t => t.length >= 4 && flat.includes(t)).length;
 
         const tld = raw.split(".").pop();
         if (!["es", "com", "net", "org", "eu"].includes(tld)) score += 2;
