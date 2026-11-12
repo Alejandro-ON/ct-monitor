@@ -88,7 +88,14 @@ export class LogTailer {
             this.okStreak = 0;
         }
 
-        return entries;
+            // Attach each entry's absolute index in the log. The certificate
+        // table keys on (log_url, log_index), so the position has to
+        // travel with the data.
+        return entries.map((entry, offset) => ({
+            index: start + offset,
+            leafInput: entry.leaf_input,
+            extraData: entry.extra_data
+        }));
     }
 
     async getTreeSize() {
@@ -154,5 +161,10 @@ export class LogTailer {
     get backlog() {
         if (this.treeSize === null || this.position === null) return 0;
         return Math.max(0, this.treeSize - this.position);
+    }
+
+    /** Resume from a persisted position instead of anchoring at the tip. */
+    resumeAt(position) {
+        this.position = position;
     }
 }
