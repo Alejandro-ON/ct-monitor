@@ -244,6 +244,28 @@ The database is the last line of defence and the only one that is always present
 
 ---
 
+### AD-06: Persist only certificates that yield a candidate
+
+**Context.** The original pipeline order was read, parse, store, classify. Measurement during collector development showed the logs deliver roughly 12,000 certificates per minute, which is **17 million per day**.
+
+Storing all of them is not viable: hundreds of gigabytes within weeks, the overwhelming majority being cloud infrastructure certificates with no relation to the study.
+
+**Decision.** A certificate is written to the database only if it reveals at least one candidate domain. Classification therefore runs **before** persistence, not after:
+
+```
+read → parse → classify → any candidates? → persist
+                               │
+                               └── no → discard, nothing stored
+```
+
+**Consequence.** At the candidate rate observed in the prototype, daily volume drops from 17 million rows to a few thousand. The cost is that a certificate discarded today cannot be revisited if the classifier is later improved; re-running against history is impossible because the collector reads from the tip.
+
+**Mitigation.** The classifier is deliberately tuned for recall over precision at the collection stage. Filtering further is a question that can be answered later against stored data; recovering a discarded certificate is not.
+
+**Note.** This constraint only became visible through measurement. It would not have been anticipated from a paper design.
+
+---
+
 ## 6. Development environment
 
 ### 6.1 Components
@@ -480,6 +502,95 @@ The sequence for every future migration:
 4. Commit only after it has applied cleanly.
 
 A migration file that has never been executed may contain syntax errors, and committing one puts the repository in a state that looks valid and is not. During development, the database is dropped and the migration reapplied as often as needed; once applied outside development, a migration is never edited, and changes go into a new numbered file.
+
+---
+
+### Session 6 · Node project and database connection
+
+**Status:** complete.
+
+npm project initialised with ES modules, `pg` installed, credentials moved to a `.env` file loaded through Node's native `--env-file`, and a connection pool module verified against the live database.
+
+**Pool configuration.** Maximum 10 simultaneous connections, idle timeout 30 s, connection timeout 5 s. The ceiling matters: Postgres allows 100 connections in total across all clients, so a single application should stay well below it.
+
+**An error listener on the pool is mandatory, not defensive.** Node terminates the process on an unhandled `error` event. An idle client can die on its own, for instance when the server restarts, so without a listener the collector would be killed by a dropped idle socket.
+
+**Parameterised queries throughout.** Values travel to Postgres on a separate channel from the statement, so they never reach the SQL parser. String interpolation into a query is treated as a defect regardless of where the value came from.
+
+**CommonJS interop.** `pg` ships as CommonJS, so only its default export is visible from an ES module. `import { Pool } from "pg"` fails; the named export has to be destructured from the default import. This applies to many long-established packages.
+
+---
+
+### Session 7 · Collector, parts 1 to 3
+
+**Status:** parts 1 to 3 complete. Branch `feat/ct-collector`.
+
+#### 7.1 Log discovery
+
+Active logs are discovered at runtime from the list Google publishes, the same one Chrome uses. Two filters apply: state must be `usable`, and the log's temporal shard must cover the present date.
+
+Hardcoding a list would mean polling retired logs and missing new shards within months, silently.
+
+Nine logs were found operating at the time of writing, from Google, Cloudflare, DigiCert, Sectigo and TrustAsia.
+
+#### 7.2 Reading loop: a throughput investigation
+
+The reading loop went through four measured states. The sequence is recorded in full because the reasoning matters more than the final code.
+
+| Throughput | Cause |
+|---|---|
+| 942 entries/min | fixed 8-second sleep every cycle, regardless of backlog |
+| 942 entries/min | first fix ineffective: broken "caught up" heuristic |
+| 4,745 entries/min | backlog compared against `tree_size`; continuous draining |
+| 6,813 entries/min | redundant `get-sth` removed; per-log adaptive pacing |
+
+**The instructive failure is the second row.** The first attempt inferred "caught up" from `entries.length < batchSize`, that is, "the server returned fewer than I asked for, so there is nothing left".
+
+That is the same false assumption the module already guards against elsewhere: **servers may return fewer entries than requested even when more exist**. Advancing the cursor by the requested range would skip certificates; inferring completion from a short response stalls the loop. Both are the same mistake in different clothing, and the second was committed two paragraphs after documenting the first.
+
+The correct test is authoritative rather than inferred: the log reports its `tree_size` on every `get-sth`, so the backlog is `tree_size - position`. No guessing required.
+
+**Why it mattered.** With a fixed sleep the backlog grew monotonically (850 → 4,327 → 8,172 → 11,862 over one minute). The cursor would have fallen progressively further behind, and detection latency, one of the study's reported metrics, would have become meaningless.
+
+#### 7.3 Adaptive behaviour
+
+Two parameters are learned per log rather than configured, because no operator documents its limits.
+
+**Batch size.** A `400` response means the log refuses a batch that large. The size halves on rejection and doubles on sustained success.
+
+**Request pacing.** A `429` means explicit rate limiting. Earlier handling paused the log for 60 seconds and then resumed at the exact rate that triggered the limit, which would produce a sawtooth. The log now carries its own minimum interval between requests, raised on rejection and eased down after sustained success.
+
+Both follow additive-increase, multiplicative-decrease, the same scheme TCP uses for congestion control. The system converges on each operator's tolerance without that tolerance being known in advance, and adapts if it changes.
+
+**`Promise.allSettled`, not `Promise.all`.** With nine logs routinely returning 400 and 429, rejecting the whole batch on a single failure would discard good data every cycle.
+
+#### 7.4 Certificate decoding
+
+Log entries arrive as base64-encoded binary structures defined in RFC 6962 section 3.4, read field by field from a `Buffer`.
+
+The decisive detail is the entry type. For `x509_entry`, the DER certificate follows a 3-byte length inside `leaf_input`. For `precert_entry`, `leaf_input` carries only the `TBSCertificate`, the certificate body without its signature, which no X.509 parser will accept; the full precertificate sits at the start of `extra_data`.
+
+**Validation:** 27 consecutive entries parsed, 0 failures, **59% precertificates**. A parser mishandling `extra_data` would throw on those 16 entries and, if the exception were swallowed, would silently discard over half the stream. The ratio is the metric that proves the handling is correct, and it is checked rather than assumed.
+
+X.509 parsing uses `node:crypto`'s built-in `X509Certificate`, so no dependency is required.
+
+#### 7.5 Observations on log behaviour
+
+Recorded because they affect interpretation of the final dataset, not because they indicate defects.
+
+**Cloudflare Nimbus2026** returned zero entries with zero backlog across three separate runs. It is operating, it simply receives little traffic.
+
+**Both Sectigo logs** alternated between zero activity and bursts of over 1,300 entries. This suggests batched rather than continuous integration, so their tree grows in steps. To be confirmed once the collector runs for hours rather than minutes.
+
+**TrustAsia** was the only operator to rate-limit, consistently. Its learned pacing settled at 500 ms.
+
+If a given log contributes few candidates in the final analysis, these notes distinguish low traffic from a collection defect.
+
+#### 7.6 Outstanding
+
+- [ ] Part 4: classifier, incorporating the three corrections from the prototype
+- [ ] Part 5: persistence with `ON CONFLICT` and the bridge table
+- [ ] Cursor persistence, so a restart does not lose position
 
 ---
 
